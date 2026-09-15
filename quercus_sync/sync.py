@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from quercus_sync.htmlutil import html_document, iso
-from quercus_sync.paths import course_folder, safe_name, unique_path
+from quercus_sync.htmlutil import canvas_file_ids, html_document, iso
+from quercus_sync.paths import clip_path, course_folder, safe_name, unique_path
 
 EventCallback = Callable[[dict[str, Any]], None]
+
+
+class SyncStopped(RuntimeError):
+    """Raised when the user asks the archive to stop."""
 
 
 class SupportsCanvas(Protocol):
@@ -18,7 +25,9 @@ class SupportsCanvas(Protocol):
     def courses(self) -> list[dict[str, Any]]: ...
     def files(self, course_id: int) -> list[dict[str, Any]]: ...
     def file(self, file_id: int) -> dict[str, Any]: ...
+    def folder_files(self, folder_id: int) -> list[dict[str, Any]]: ...
     def folders(self, course_id: int) -> list[dict[str, Any]]: ...
+    def front_page(self, course_id: int) -> dict[str, Any] | None: ...
     def modules(self, course_id: int) -> list[dict[str, Any]]: ...
     def pages(self, course_id: int) -> list[dict[str, Any]]: ...
     def page(self, course_id: int, slug: str) -> dict[str, Any]: ...
@@ -26,6 +35,8 @@ class SupportsCanvas(Protocol):
     def announcements(self, course_id: int) -> list[dict[str, Any]]: ...
     def discussions(self, course_id: int) -> list[dict[str, Any]]: ...
     def discussion(self, course_id: int, topic_id: int) -> dict[str, Any]: ...
+    def quizzes(self, course_id: int) -> list[dict[str, Any]]: ...
+    def calendar_events(self, course_id: int) -> list[dict[str, Any]]: ...
     def download(self, url: str) -> tuple[bytes, str]: ...
 
 
@@ -59,7 +70,13 @@ DEFAULT_INCLUDE = (
     "assignments",
     "announcements",
     "syllabus",
+    "discussions",
+    "quizzes",
+    "calendar",
 )
+
+# A few parallel file downloads. Canvas JSON listing stays sequential to limit 429s.
+DOWNLOAD_WORKERS = 4
 
 
 class CourseSync:
@@ -69,6 +86,7 @@ class CourseSync:
         download_dir: Path,
         include: list[str] | None = None,
         on_event: EventCallback | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.client = client
         self.download_dir = Path(download_dir)
@@ -76,20 +94,40 @@ class CourseSync:
         self.on_event = on_event or (lambda _event: None)
         self.stats = SyncStats()
         self.errors: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = stop_event or threading.Event()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def _stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def _check_stop(self) -> None:
+        if self._stop.is_set():
+            raise SyncStopped("Stopped")
 
     def emit(self, **event: Any) -> None:
         self.on_event(event)
 
     def list_courses(self) -> list[dict[str, Any]]:
         courses = [c for c in self.client.courses() if is_accessible_course(c)]
-        courses.sort(
+        unique: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        for course in courses:
+            course_id = course.get("id")
+            if course_id in seen:
+                continue
+            seen.add(course_id)
+            unique.append(course)
+        unique.sort(
             key=lambda c: (
                 0 if course_access(c) == "current" else 1,
                 (c.get("term") or {}).get("name") or "",
                 c.get("course_code") or c.get("name") or "",
             )
         )
-        return courses
+        return unique
 
     def run(self, course_ids: list[int] | None = None) -> SyncResult:
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -100,8 +138,12 @@ class CourseSync:
         self.emit(type="log", message=f"Archiving {len(courses)} course(s) into {self.download_dir}")
         for course in courses:
             try:
+                self._check_stop()
                 self._sync_course(course)
                 self.stats.courses += 1
+            except SyncStopped:
+                self.emit(type="log", message="Stopped")
+                break
             except Exception as exc:  # noqa: BLE001 — surface per-course failures
                 message = f"{course.get('course_code')}: {exc}"
                 self.errors.append(message)
@@ -121,33 +163,60 @@ class CourseSync:
             id=course["id"],
         )
         course_id = int(course["id"])
-        folders = {f["id"]: f for f in self.client.folders(course_id)} if "files" in self.include else {}
+        folders: dict[int, dict[str, Any]] = {}
+        if "files" in self.include:
+            try:
+                folders = {f["id"]: f for f in self.client.folders(course_id) if f.get("id") is not None}
+            except Exception as exc:  # noqa: BLE001
+                self._skip("folders", str(exc))
+        html_blobs: list[str] = []
+        known_ids: set[Any] = set()
 
         if "syllabus" in self.include:
+            body = course.get("syllabus_body") or ""
+            html_blobs.append(body)
             self._write_html(
                 root / "Syllabus.html",
                 f"{folder_name} syllabus",
-                course.get("syllabus_body") or "",
+                body,
                 {"Term": term, "Course": course.get("course_code")},
             )
 
         if "files" in self.include:
-            self._sync_files(course_id, root, folders)
+            self._check_stop()
+            known_ids = self._sync_files(course_id, root, folders)
 
         if "modules" in self.include:
+            self._check_stop()
             self._sync_modules(course_id, root)
 
         if "pages" in self.include:
-            self._sync_pages(course_id, root)
+            self._check_stop()
+            html_blobs.extend(self._sync_pages(course_id, root))
 
         if "assignments" in self.include:
-            self._sync_assignments(course_id, root)
+            self._check_stop()
+            html_blobs.extend(self._sync_assignments(course_id, root))
 
         if "announcements" in self.include:
-            self._sync_announcements(course_id, root)
+            self._check_stop()
+            html_blobs.extend(self._sync_announcements(course_id, root))
 
         if "discussions" in self.include:
-            self._sync_discussions(course_id, root)
+            self._check_stop()
+            html_blobs.extend(self._sync_discussions(course_id, root))
+
+        if "quizzes" in self.include:
+            self._check_stop()
+            html_blobs.extend(self._sync_quizzes(course_id, root))
+
+        if "calendar" in self.include:
+            self._check_stop()
+            self._sync_calendar(course_id, root)
+
+        if "files" in self.include:
+            self._check_stop()
+            self._sync_html_files(course_id, root, known_ids, html_blobs)
 
         manifest = {
             "course_id": course_id,
@@ -160,29 +229,86 @@ class CourseSync:
         (root / "_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.emit(type="course_done", course=folder_name)
 
-    def _sync_files(self, course_id: int, root: Path, folders: dict[int, dict[str, Any]]) -> None:
-        catalog = list(self.client.files(course_id))
+    def _sync_files(self, course_id: int, root: Path, folders: dict[int, dict[str, Any]]) -> set[Any]:
+        try:
+            catalog = list(self.client.files(course_id))
+        except Exception as exc:  # noqa: BLE001
+            self._skip("Files tab", str(exc))
+            catalog = []
         known = {item.get("id") for item in catalog if item.get("id") is not None}
+        for folder in folders.values():
+            folder_id = folder.get("id")
+            if folder_id is None:
+                continue
+            try:
+                extra_rows = self.client.folder_files(int(folder_id))
+            except Exception as exc:  # noqa: BLE001
+                self._fail(f"folder {folder.get('full_name') or folder_id}", str(exc))
+                continue
+            for item in extra_rows:
+                item_id = item.get("id")
+                if item_id in known:
+                    continue
+                catalog.append(item)
+                if item_id is not None:
+                    known.add(item_id)
         catalog.extend(self._extra_files(course_id, known))
         seen: set[int] = set()
+        jobs: list[dict[str, Any]] = []
         for item in catalog:
             file_id = item.get("id")
             if file_id in seen:
                 continue
             if file_id is not None:
                 seen.add(int(file_id))
-            if item.get("locked_for_user"):
-                self._skip(item.get("display_name") or "file", "locked on Quercus")
-                continue
-            folder_meta = folders.get(item.get("folder_id")) or {}
-            relative = _folder_relative(
-                folder_meta.get("full_name") or item.get("_folder") or "course files"
-            )
-            dest_dir = root / "Files" / relative
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            filename = safe_name(item.get("display_name") or item.get("filename") or f"file-{item.get('id')}")
-            dest = dest_dir / filename
-            self._download_file(item.get("url"), dest, label=filename, size=item.get("size"))
+                known.add(int(file_id))
+            jobs.append(item)
+        self._run_parallel(lambda row: self._save_file_item(row, root, folders), jobs)
+        return known
+
+    def _run_parallel(self, fn: Callable[[Any], None], items: list[Any]) -> None:
+        if not items:
+            return
+        if len(items) == 1:
+            fn(items[0])
+            return
+        workers = min(DOWNLOAD_WORKERS, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            for item in items:
+                if self._stopped():
+                    break
+                futures.append(pool.submit(fn, item))
+            for future in as_completed(futures):
+                if self._stopped():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001
+                    self._fail("download", str(exc))
+
+    def _save_file_item(
+        self,
+        item: dict[str, Any],
+        root: Path,
+        folders: dict[int, dict[str, Any]],
+    ) -> None:
+        if self._stopped():
+            return
+        if item.get("locked_for_user"):
+            self._skip(item.get("display_name") or "file", "locked on Quercus")
+            return
+        folder_meta = folders.get(item.get("folder_id")) or {}
+        relative = _folder_relative(
+            folder_meta.get("full_name") or item.get("_folder") or "course files"
+        )
+        dest_dir = root / "Files" / relative
+        filename = safe_name(item.get("display_name") or item.get("filename") or f"file-{item.get('id')}")
+        dest = clip_path(dest_dir / filename)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._download_file(item.get("url"), dest, label=filename, size=item.get("size"))
 
     def _extra_files(self, course_id: int, known_ids: set[Any]) -> list[dict[str, Any]]:
         """Files attached to modules/assignments but missing from the Files tab."""
@@ -224,7 +350,75 @@ class CourseSync:
                 extras.append(attachment)
                 if att_id is not None:
                     known_ids.add(att_id)
+        try:
+            posts = self.client.announcements(course_id)
+        except Exception as exc:  # noqa: BLE001
+            self._fail("announcements", str(exc))
+            posts = []
+        for post in posts:
+            extras.extend(
+                self._collect_attachments(
+                    post.get("attachments") or [],
+                    known_ids,
+                    f"course files/From announcements/{post.get('title') or 'announcement'}",
+                )
+            )
+        try:
+            topics = self.client.discussions(course_id)
+        except Exception as exc:  # noqa: BLE001
+            self._fail("discussions", str(exc))
+            topics = []
+        for topic in topics:
+            extras.extend(
+                self._collect_attachments(
+                    topic.get("attachments") or [],
+                    known_ids,
+                    f"course files/From discussions/{topic.get('title') or 'discussion'}",
+                )
+            )
         return extras
+
+    def _collect_attachments(
+        self,
+        attachments: list[dict[str, Any]],
+        known_ids: set[Any],
+        folder: str,
+    ) -> list[dict[str, Any]]:
+        extras: list[dict[str, Any]] = []
+        for attachment in attachments:
+            att_id = attachment.get("id")
+            if att_id in known_ids:
+                continue
+            attachment.setdefault("_folder", folder)
+            extras.append(attachment)
+            if att_id is not None:
+                known_ids.add(att_id)
+        return extras
+
+    def _sync_html_files(
+        self,
+        course_id: int,
+        root: Path,
+        known_ids: set[Any],
+        html_blobs: list[str],
+    ) -> None:
+        """Download Canvas files linked in page/syllabus HTML even if hidden from Files."""
+        wanted: set[int] = set()
+        for blob in html_blobs:
+            wanted.update(canvas_file_ids(blob))
+        extras: list[dict[str, Any]] = []
+        for file_id in sorted(wanted):
+            if file_id in known_ids:
+                continue
+            try:
+                meta = self.client.file(file_id)
+            except Exception as exc:  # noqa: BLE001
+                self._fail(f"linked file {file_id}", str(exc))
+                continue
+            meta.setdefault("_folder", "course files/From pages")
+            known_ids.add(file_id)
+            extras.append(meta)
+        self._run_parallel(lambda row: self._save_file_item(row, root, {}), extras)
 
     def _sync_modules(self, course_id: int, root: Path) -> None:
         modules = self.client.modules(course_id)
@@ -240,12 +434,20 @@ class CourseSync:
                 kind = item.get("type")
                 lines.append(f"- {kind}: {title}")
                 if kind == "ExternalUrl" and item.get("external_url"):
-                    (module_dir / f"{safe_name(title)}.url.txt").write_text(
-                        item["external_url"] + "\n", encoding="utf-8"
-                    )
-                    self._saved(module_dir / f"{safe_name(title)}.url.txt")
-            (module_dir / "module.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-            self._saved(module_dir / "module.md")
+                    link_path = clip_path(module_dir / f"{safe_name(title)}.url.txt")
+                    try:
+                        link_path.parent.mkdir(parents=True, exist_ok=True)
+                        link_path.write_text(item["external_url"] + "\n", encoding="utf-8")
+                        self._saved(link_path)
+                    except OSError as exc:
+                        self._fail(title, str(exc))
+            try:
+                module_md = clip_path(module_dir / "module.md")
+                module_md.parent.mkdir(parents=True, exist_ok=True)
+                module_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self._saved(module_md)
+            except OSError as exc:
+                self._fail(name, str(exc))
             index_rows.append(f"- {position}. {module.get('name')}")
         if index_rows:
             (root / "Modules" / "README.md").write_text(
@@ -253,67 +455,92 @@ class CourseSync:
             )
             self._saved(root / "Modules" / "README.md")
 
-    def _sync_pages(self, course_id: int, root: Path) -> None:
+    def _sync_pages(self, course_id: int, root: Path) -> list[str]:
         dest = root / "Pages"
         dest.mkdir(parents=True, exist_ok=True)
-        for summary in self.client.pages(course_id):
+        bodies: list[str] = []
+        seen_slugs: set[str] = set()
+        summaries = list(self.client.pages(course_id))
+        try:
+            front = self.client.front_page(course_id)
+        except Exception as exc:  # noqa: BLE001
+            self._fail("front page", str(exc))
+            front = None
+        if front:
+            summaries = [front] + summaries
+        for summary in summaries:
             slug = summary.get("url")
-            if not slug:
+            if not slug or slug in seen_slugs:
                 continue
+            seen_slugs.add(str(slug))
             try:
-                page = self.client.page(course_id, slug)
+                page = self.client.page(course_id, slug) if "body" not in summary else summary
             except Exception as exc:  # noqa: BLE001
                 self._fail(slug, str(exc))
                 continue
+            body = page.get("body") or ""
+            bodies.append(body)
             filename = safe_name(page.get("title") or slug) + ".html"
             self._write_html(
                 dest / filename,
                 page.get("title") or slug,
-                page.get("body") or "",
+                body,
                 {"Updated": iso(page.get("updated_at")), "Slug": slug},
             )
+        return bodies
 
-    def _sync_assignments(self, course_id: int, root: Path) -> None:
+    def _sync_assignments(self, course_id: int, root: Path) -> list[str]:
         dest = root / "Assignments"
         dest.mkdir(parents=True, exist_ok=True)
+        bodies: list[str] = []
         for assignment in self.client.assignments(course_id):
             name = safe_name(assignment.get("name") or f"assignment-{assignment.get('id')}")
+            body = assignment.get("description") or ""
+            bodies.append(body)
             path = dest / f"{name}.html"
             self._write_html(
                 path,
                 assignment.get("name") or name,
-                assignment.get("description") or "",
+                body,
                 {
                     "Due": iso(assignment.get("due_at")) or "No due date",
                     "Points": assignment.get("points_possible"),
                 },
             )
+        return bodies
 
-    def _sync_announcements(self, course_id: int, root: Path) -> None:
+    def _sync_announcements(self, course_id: int, root: Path) -> list[str]:
         dest = root / "Announcements"
         dest.mkdir(parents=True, exist_ok=True)
+        bodies: list[str] = []
         for post in self.client.announcements(course_id):
             posted = (post.get("posted_at") or "")[:10]
             name = safe_name(f"{posted} {post.get('title') or post.get('id')}") + ".html"
+            body = post.get("message") or ""
+            bodies.append(body)
             self._write_html(
                 dest / name,
                 post.get("title") or "Announcement",
-                post.get("message") or "",
+                body,
                 {"Posted": iso(post.get("posted_at"))},
             )
+        return bodies
 
-    def _sync_discussions(self, course_id: int, root: Path) -> None:
+    def _sync_discussions(self, course_id: int, root: Path) -> list[str]:
         dest = root / "Discussions"
         dest.mkdir(parents=True, exist_ok=True)
+        bodies: list[str] = []
         for topic in self.client.discussions(course_id):
             title = topic.get("title") or f"topic-{topic.get('id')}"
             body = topic.get("message") or ""
+            bodies.append(body)
             try:
                 view = self.client.discussion(course_id, int(topic["id"]))
             except Exception:
                 view = {"view": []}
             replies = []
             for reply in view.get("view") or []:
+                bodies.append(reply.get("message") or "")
                 replies.append(
                     f"<li>{reply.get('message') or ''}<p class='meta'>user {reply.get('user_id')} · {iso(reply.get('created_at'))}</p></li>"
                 )
@@ -324,49 +551,119 @@ class CourseSync:
                 (body or "") + extra,
                 {"Posted": iso(topic.get("posted_at"))},
             )
+        return bodies
+
+    def _sync_quizzes(self, course_id: int, root: Path) -> list[str]:
+        """Quiz titles and instructions only — not question banks."""
+        dest = root / "Quizzes"
+        dest.mkdir(parents=True, exist_ok=True)
+        bodies: list[str] = []
+        try:
+            quizzes = self.client.quizzes(course_id)
+        except Exception as exc:  # noqa: BLE001
+            self._fail("quizzes", str(exc))
+            return bodies
+        if not quizzes:
+            return bodies
+        for quiz in quizzes:
+            title = quiz.get("title") or f"quiz-{quiz.get('id')}"
+            body = quiz.get("description") or ""
+            bodies.append(body)
+            self._write_html(
+                dest / (safe_name(title) + ".html"),
+                title,
+                body,
+                {
+                    "Due": iso(quiz.get("due_at")) or "No due date",
+                    "Points": quiz.get("points_possible"),
+                },
+            )
+        return bodies
+
+    def _sync_calendar(self, course_id: int, root: Path) -> None:
+        try:
+            events = self.client.calendar_events(course_id)
+        except Exception as exc:  # noqa: BLE001
+            self._fail("calendar", str(exc))
+            return
+        if not events:
+            return
+        rows = []
+        for event in events:
+            title = event.get("title") or "Event"
+            start = iso(event.get("start_at")) or iso(event.get("start_date"))
+            desc = event.get("description") or ""
+            rows.append(f"<h2>{title}</h2><p class='meta'>{start}</p>{desc}")
+        self._write_html(
+            root / "Calendar.html",
+            "Course calendar",
+            "\n".join(rows),
+            {"Events": len(events)},
+        )
 
     def _write_html(self, path: Path, title: str, body: str, meta: dict[str, Any] | None = None) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        document = html_document(title, body, meta)
-        if path.exists() and path.read_text(encoding="utf-8") == document:
-            self._skip(str(path.relative_to(self.download_dir)), "unchanged")
-            return
-        path.write_text(document, encoding="utf-8")
-        self._saved(path)
+        path = clip_path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            document = html_document(title, body, meta)
+            if path.exists() and path.read_text(encoding="utf-8") == document:
+                self._skip(_rel(path, self.download_dir), "unchanged")
+                return
+            path.write_text(document, encoding="utf-8")
+            self._saved(path)
+        except OSError as exc:
+            self._fail(title, str(exc))
 
     def _download_file(self, url: str | None, dest: Path, label: str, size: int | None = None) -> None:
+        if self._stopped():
+            return
         if not url:
             self._skip(label, "no download URL")
             return
+        dest = clip_path(dest)
         if dest.exists() and size and dest.stat().st_size == size:
-            self._skip(str(dest.relative_to(self.download_dir)), "unchanged")
+            self._skip(_rel(dest, self.download_dir), "unchanged")
             return
         if dest.exists() and not size:
-            self._skip(str(dest.relative_to(self.download_dir)), "already on disk")
+            self._skip(_rel(dest, self.download_dir), "already on disk")
             return
-        try:
-            body, _content_type = self.client.download(url)
-        except Exception as exc:  # noqa: BLE001
-            self._fail(label, str(exc))
-            return
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        target = dest if not dest.exists() else unique_path(dest)
-        target.write_bytes(body)
-        self._saved(target)
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                body, _content_type = self.client.download(url)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                target = dest if not dest.exists() else unique_path(dest)
+                target.write_bytes(body)
+                self._saved(target)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                message = str(exc)
+                retryable = any(
+                    token in message
+                    for token in ("10054", "10053", "Connection", "reset", "timed out", "Timeout")
+                )
+                if (not retryable) or attempt == 3:
+                    break
+                time.sleep(min(1.5 * (attempt + 1), 8))
+        self._fail(label, str(last_error) if last_error else "download failed")
 
     def _saved(self, path: Path) -> None:
-        self.stats.downloaded += 1
         rel = _rel(path, self.download_dir)
-        self.emit(type="item", status="downloaded", path=rel, kind=_kind_from_path(rel))
+        with self._lock:
+            self.stats.downloaded += 1
+            self.emit(type="item", status="downloaded", path=rel, kind=_kind_from_path(rel))
 
     def _skip(self, label: str, reason: str) -> None:
-        self.stats.skipped += 1
-        self.emit(type="item", status="skipped", path=label, reason=reason)
+        with self._lock:
+            self.stats.skipped += 1
+            self.emit(type="item", status="skipped", path=label, reason=reason)
 
     def _fail(self, label: str, reason: str) -> None:
-        self.stats.failed += 1
-        self.errors.append(f"{label}: {reason}")
-        self.emit(type="item", status="failed", path=label, reason=reason)
+        with self._lock:
+            self.stats.failed += 1
+            self.errors.append(f"{label}: {reason}")
+            self.emit(type="item", status="failed", path=label, reason=reason)
 
 
 def _folder_relative(full_name: str) -> Path:
@@ -385,6 +682,7 @@ def _rel(path: Path, root: Path) -> str:
 
 
 def _kind_from_path(rel: str) -> str:
+    rel = rel.replace("\\", "/")
     if "/Files/" in rel or rel.startswith("Files"):
         return "file"
     if "/Pages/" in rel:
@@ -395,6 +693,12 @@ def _kind_from_path(rel: str) -> str:
         return "announcement"
     if "/Modules/" in rel:
         return "module"
+    if "/Quizzes/" in rel:
+        return "quiz"
+    if "/Discussions/" in rel:
+        return "discussion"
+    if rel.endswith("Calendar.html"):
+        return "calendar"
     if rel.endswith("Syllabus.html"):
         return "syllabus"
     return "item"

@@ -5,10 +5,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CANVAS_URL = "https://q.utoronto.ca"
+load_dotenv(APP_DIR / ".env")
 
 INCLUDE_CHOICES = (
     "files",
@@ -18,6 +20,8 @@ INCLUDE_CHOICES = (
     "announcements",
     "syllabus",
     "discussions",
+    "quizzes",
+    "calendar",
 )
 
 
@@ -41,6 +45,9 @@ class AppConfig(BaseModel):
             "assignments",
             "announcements",
             "syllabus",
+            "discussions",
+            "quizzes",
+            "calendar",
         ]
     )
     demo_mode: bool = True

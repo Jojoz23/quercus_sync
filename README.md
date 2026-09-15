@@ -1,120 +1,67 @@
 # Quercus Sync
 
-A local archive of **your** University of Toronto Mississauga courses on [Quercus](https://q.utoronto.ca).
+A local archive of **your** University of Toronto Mississauga courses on [Quercus](https://q.utoronto.ca). Put a Canvas access token in `.env`, then pick courses in the UI.
 
-Quercus is Canvas. The reliable way to copy course material to your laptop is the **Canvas REST API** with an access token from your own account — not a browser agent clicking through modules.
+![Course list](docs/screenshots/ui.png)
 
-## Why not an agent?
+The token is a student credential from Account → Settings → New Access Token. It has the same access as the website. Locked or date-restricted courses are skipped. Quiz questions are not fetched.
 
-A Playwright/LLM agent against `q.utoronto.ca` will fight session cookies, Duo, pagination, and file redirects to object storage. It will also miss items that never appear as a normal link (paginated Files, module items, pages). Canvas already exposes those as JSON:
-
-- `GET /api/v1/courses`
-- `GET /api/v1/courses/:id/files`
-- `GET /api/v1/courses/:id/modules?include[]=items`
-- `GET /api/v1/courses/:id/pages/:url`
-- `GET /api/v1/courses/:id/assignments`
-- `GET /api/v1/announcements?context_codes[]=course_:id`
-
-This tool walks those endpoints, follows Canvas download redirects, and writes a folder tree you can grep, back up, or open offline.
-
-## Where the code is
-
-This repo is the whole app. The important files:
-
-| File | What it does |
-| --- | --- |
-| `quercus_sync/canvas.py` | HTTP client for Canvas (`https://q.utoronto.ca/api/v1/...`) |
-| `quercus_sync/sync.py` | Turns API JSON into a folder tree; skips date-locked courses |
-| `quercus_sync/web.py` + `quercus_sync/static/` | Local UI on port 43147 |
-| `quercus_sync/cli.py` | `quercus-sync courses` / `sync` / `serve` |
-| `quercus_sync/mock.py` | Sample UTM term so you can try it without a token |
-
-Run it from the repo root after `pip install -e .`.
-
-## How the Canvas API works (and yes, students have it)
-
-Quercus is Instructure Canvas. The website and the API are the same permission model.
-
-1. You sign in at [q.utoronto.ca](https://q.utoronto.ca) (UTORid + Duo, same as always).
-2. **Account → Settings → New Access Token**. That token is a student credential. You do not need a developer key, an instructor role, or ITS to “turn on the API.”
-3. Every request sends `Authorization: Bearer <token>` to `/api/v1/...`.
-4. Canvas answers with the courses, files, and pages **you** can already see. If a file is locked, unpublished, or the course is past its access date, the API returns 403 / `locked_for_user` / `access_restricted_by_date` — same as the site.
-
-Useful student endpoints this tool calls:
-
-```
-GET /api/v1/users/self
-GET /api/v1/courses?enrollment_state[]=active&enrollment_state[]=completed
-GET /api/v1/courses/:id/files
-GET /api/v1/courses/:id/modules?include[]=items
-GET /api/v1/files/:id
-GET /api/v1/courses/:id/pages/:url
-GET /api/v1/courses/:id/assignments
-GET /api/v1/announcements?context_codes[]=course_:id
-```
-
-Official reference: [Canvas LMS API](https://canvas.instructure.com/doc/api/). Treat the token like a password; it can act as you until you revoke it.
-
-U of T still owns the files. This is a personal archive of material your enrolment already allows — not a way around locks, and not something to redistribute.
-
-## What it downloads
-
-From every course your token can still open (this term and concluded terms that Quercus has not date-locked):
-
-- Course files (the Files tab), keeping folder names
-- Files that only appear inside modules or as assignment attachments
-- Module outlines
-- Wiki pages
-- Assignment descriptions
-- Announcements
-- Syllabus body
-
-Optional: discussion threads.
-
-It **does not** pull quiz questions, other students’ submissions, or files marked locked for you. Incremental runs skip files whose size already matches.
+![Archive and Stop](docs/screenshots/archive.png)
 
 ## Setup
 
-Python 3.11+.
+Python 3.11+. Copy the example env file and paste your token — the web UI does not take one.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
+```powershell
+copy .env.example .env
+```
+
+Edit `.env`:
+
+```
+QUERCUS_CANVAS_URL=https://q.utoronto.ca
+QUERCUS_TOKEN=paste-your-token-here
+QUERCUS_DOWNLOAD_DIR=downloads
+```
+
+Create the token while signed in at [q.utoronto.ca](https://q.utoronto.ca): **Account → Settings → New Access Token**. Do not commit `.env`.
+
+Then:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
 pip install -e ".[dev]"
-```
-
-### Access token (real Quercus)
-
-1. Sign in at [q.utoronto.ca](https://q.utoronto.ca).
-2. **Account → Settings → New Access Token**.
-3. Purpose: `Quercus Sync on my laptop`. Leave the expiry blank or set one.
-4. Paste it in the web UI, or:
-
-```bash
-quercus-sync set-token
-quercus-sync doctor
-quercus-sync courses
-quercus-sync sync
-```
-
-The token is stored in `data/config.json` on this machine. Do not commit it. Treat it like a password: it can act as you on Quercus.
-
-### Demo campus
-
-If you just want to see the layout, skip the token. The app ships a sample Fall UTM term (CSC148, MAT102, PSY100, ERS111) and will archive it into `downloads/`.
-
-```bash
-quercus-sync sync --demo
-quercus-sync serve --host 127.0.0.1 --port 43147
-```
-
-## Web UI
-
-```bash
 python -m quercus_sync
 ```
 
-Open [http://127.0.0.1:43147](http://127.0.0.1:43147). Save a token or stay on the demo campus, tick courses, archive. Files land under `downloads/{term}/{course}/`.
+Open [http://127.0.0.1:43147](http://127.0.0.1:43147). Tick courses, **Archive selected** or **Archive all**. **Stop** ends a run after the current file. Files land under `downloads/{term}/{course}/`. Restart the app after you change `.env`.
+
+macOS / Linux:
+
+```bash
+cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+python -m quercus_sync
+```
+
+With no token, the app uses a built-in demo campus so you can try the layout.
+
+```bash
+quercus-sync sync --demo
+```
+
+## What it downloads
+
+From every course your token can still open (this term and concluded terms that are not date-locked):
+
+- Course files (and files linked from pages, modules, and assignments)
+- Module outlines, wiki pages, assignment descriptions, announcements, syllabus
+- Discussions, quiz instructions (not questions), calendar events
+
+Incremental runs skip files whose size already matches.
 
 ## Folder layout
 
@@ -131,16 +78,29 @@ downloads/
       _manifest.json
 ```
 
-## St. George / other Canvas schools
+## How it talks to Quercus
 
-Point the Canvas URL at your instance (`https://q.utoronto.ca` is the U of T default; some faculties still use an Instructure host). The API is the same.
+Quercus is Canvas. Requests send `Authorization: Bearer <token>` to `/api/v1/...`. If a file is locked or the course is past its access date, the API returns 403 — same as the site.
 
-## Limits and rules
+```
+GET /api/v1/users/self
+GET /api/v1/courses?enrollment_state[]=active&enrollment_state[]=completed
+GET /api/v1/courses/:id/files
+GET /api/v1/files/:id
+GET /api/v1/courses/:id/modules?include[]=items
+```
+
+Official reference: [Canvas LMS API](https://canvas.instructure.com/doc/api/).
+
+## Other Canvas schools
+
+Set `QUERCUS_CANVAS_URL` in `.env` to your instance. The API is the same.
+
+## Limits
 
 - Personal study copy of courses **you** can already open. Do not redistribute lecture PDFs or publisher packs.
-- U of T and your instructors still own the material; Quercus remains the source of truth for due dates and submissions.
-- If an item is locked, unpublished, or embargoed until a date, this client cannot (and should not) bypass that.
-- Rate limits: the client backs off on HTTP 429.
+- Quercus remains the source of truth for due dates and submissions.
+- The client backs off on HTTP 429.
 
 ## Development
 

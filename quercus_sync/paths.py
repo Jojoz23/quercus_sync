@@ -39,6 +39,31 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
+def clip_path(path: Path, limit: int = 240) -> Path:
+    """Keep Windows paths under MAX_PATH so long Quercus titles do not fail to write."""
+    path = Path(path)
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    parts = list(absolute.parts)
+    while len(str(Path(*parts))) > limit:
+        idx = None
+        longest = 12
+        for i, part in enumerate(parts):
+            if i == 0:
+                continue
+            if len(part) > longest:
+                longest = len(part)
+                idx = i
+        if idx is None:
+            break
+        stem, suffix = Path(parts[idx]).stem, Path(parts[idx]).suffix
+        keep = max(8, len(stem) - 12)
+        shortened = (stem[:keep].rstrip(" .") or "item") + suffix
+        if shortened == parts[idx]:
+            break
+        parts[idx] = shortened
+    return Path(*parts)
+
+
 def course_folder(code: str, name: str) -> str:
     code = safe_name(code, "COURSE")
     name = safe_name(name, "Untitled course")

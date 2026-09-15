@@ -19,3 +19,11 @@ def test_unique_path(tmp_path: Path):
     target.write_text("one")
     second = unique_path(target)
     assert second.name == "notes (2).pdf"
+
+
+def test_clip_path_shortens_long_windows_names(tmp_path: Path):
+    from quercus_sync.paths import clip_path
+
+    long = tmp_path / ("folder " + "x" * 80) / ("file " + "y" * 80 + ".pdf")
+    clipped = clip_path(long, limit=len(str(tmp_path)) + 40)
+    assert len(str(clipped)) <= len(str(tmp_path)) + 40

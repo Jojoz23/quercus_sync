@@ -1,5 +1,8 @@
 const $ = (sel) => document.querySelector(sel);
 
+let activeJob = null;
+let eventSource = null;
+
 async function api(path, options = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -14,71 +17,69 @@ async function api(path, options = {}) {
   return data;
 }
 
-function setStatus(el, text, ok = true) {
-  el.hidden = !text;
-  el.textContent = text;
-  el.className = `status ${ok ? "ok" : "bad"}`;
-}
-
-function includesFromForm(form) {
-  return [...form.querySelectorAll('input[name="include"]:checked')].map((n) => n.value);
+function setRunning(running) {
+  $("#sync-btn").disabled = running;
+  $("#sync-all").disabled = running;
+  $("#stop-btn").disabled = !running;
 }
 
 async function loadConfig() {
   const cfg = await api("/api/config");
-  const form = $("#settings-form");
-  form.canvas_url.value = cfg.canvas_url;
-  form.download_dir.value = cfg.download_dir;
-  form.querySelectorAll('input[name="include"]').forEach((box) => {
-    box.checked = cfg.include.includes(box.value);
-  });
-  $("#token-hint").textContent = cfg.token_set
-    ? `Saved token ${cfg.token_preview}. It stays in data/config.json on this computer.`
-    : "No token saved — demo library is active.";
   const demo = cfg.demo_mode || !cfg.token_set;
-  $("#mode-pill").textContent = demo ? "Demo campus" : "Live Quercus";
+  $("#mode-pill").textContent = demo ? "Demo" : "Live";
   $("#mode-pill").classList.toggle("live", !demo);
-  $("#toggle-demo").textContent = demo ? "Use live Quercus" : "Use demo campus";
+  $("#env-banner").hidden = !demo;
+  $("#folder-hint").textContent = cfg.download_dir || "";
   return cfg;
 }
 
 async function loadMe() {
   try {
     const me = await api("/api/me");
-    $("#who").textContent = me.demo
-      ? `${me.name} · sample student`
-      : `${me.name} · ${me.login || "signed in"}`;
+    $("#who").textContent = me.name || "";
   } catch (err) {
     $("#who").textContent = err.message;
   }
 }
 
+let coursesLoad = 0;
+
 async function loadCourses() {
+  const gen = ++coursesLoad;
   const empty = $("#course-empty");
   const list = $("#course-list");
   list.innerHTML = "";
   empty.hidden = false;
-  empty.textContent = "Loading courses…";
+  empty.textContent = "Loading…";
   try {
     const data = await api("/api/courses");
-    if (!data.courses.length) {
-      empty.textContent = "No courses came back. Check the token — this lists every course you can still open, including past terms.";
+    if (gen !== coursesLoad) return;
+    const seen = new Set();
+    const courses = [];
+    for (const course of data.courses || []) {
+      if (seen.has(course.id)) continue;
+      seen.add(course.id);
+      courses.push(course);
+    }
+    if (!courses.length) {
+      empty.textContent = "No open courses.";
       return;
     }
     empty.hidden = true;
-    for (const course of data.courses) {
+    for (const course of courses) {
       const li = document.createElement("li");
-      const access = course.access === "past" ? "Past term" : "Current";
+      const access = course.access === "past" ? "Past" : "Current";
       li.innerHTML = `
         <input type="checkbox" checked data-id="${course.id}">
         <div>
           <strong>${escapeHtml(course.course_code || "Course")}</strong>
           ${escapeHtml(course.name || "")}
-          <span>${escapeHtml(course.term || "No term")} · ${access}</span>
+          <span>${escapeHtml(course.term || "")} · ${access}</span>
         </div>`;
       list.appendChild(li);
     }
   } catch (err) {
+    if (gen !== coursesLoad) return;
     empty.textContent = err.message;
   }
 }
@@ -113,7 +114,16 @@ function formatSize(n) {
 
 function selectedCourseIds(all = false) {
   const boxes = [...document.querySelectorAll('#course-list input[type="checkbox"]')];
-  return boxes.filter((b) => all || b.checked).map((b) => Number(b.dataset.id));
+  const ids = [];
+  const seen = new Set();
+  for (const box of boxes) {
+    if (!all && !box.checked) continue;
+    const id = Number(box.dataset.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 function logLine(text, cls) {
@@ -124,14 +134,26 @@ function logLine(text, cls) {
   item.scrollIntoView({ block: "end" });
 }
 
+function finishSync(stats) {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  activeJob = null;
+  setRunning(false);
+  if (stats) {
+    $("#log-meta").textContent = `Saved ${stats.downloaded || 0} · skipped ${stats.skipped || 0} · failed ${stats.failed || 0}`;
+  }
+  loadLibrary();
+}
+
 async function runSync(all = false) {
   const ids = selectedCourseIds(all);
   if (!ids.length) {
     logLine("Select at least one course.", "fail");
     return;
   }
-  $("#sync-btn").disabled = true;
-  $("#sync-all").disabled = true;
+  setRunning(true);
   $("#log").innerHTML = "";
   $("#log-meta").textContent = "Starting…";
   try {
@@ -139,8 +161,9 @@ async function runSync(all = false) {
       method: "POST",
       body: JSON.stringify({ course_ids: ids }),
     });
-    const events = new EventSource(`/api/sync/${job_id}/events`);
-    events.onmessage = (msg) => {
+    activeJob = job_id;
+    eventSource = new EventSource(`/api/sync/${job_id}/events`);
+    eventSource.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
       if (event.type === "log") logLine(event.message);
       if (event.type === "course_start") logLine(`${event.course} · ${event.term}`, "course");
@@ -150,81 +173,30 @@ async function runSync(all = false) {
         logLine(`${event.status}  ${event.path}${extra}`, cls);
       }
       if (event.type === "error") logLine(event.message, "error");
-      if (event.type === "done") {
-        const s = event.stats || {};
-        $("#log-meta").textContent = `Saved ${s.downloaded || 0} · skipped ${s.skipped || 0} · failed ${s.failed || 0}`;
-        events.close();
-        $("#sync-btn").disabled = false;
-        $("#sync-all").disabled = false;
-        loadLibrary();
-      }
+      if (event.type === "done") finishSync(event.stats);
     };
-    events.onerror = () => {
-      events.close();
-      $("#sync-btn").disabled = false;
-      $("#sync-all").disabled = false;
-    };
+    eventSource.onerror = () => finishSync();
   } catch (err) {
     logLine(err.message, "error");
-    $("#sync-btn").disabled = false;
-    $("#sync-all").disabled = false;
+    finishSync();
   }
 }
 
-$("#settings-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const form = e.target;
-  const status = $("#save-status");
+async function stopSync() {
+  if (!activeJob) return;
+  $("#stop-btn").disabled = true;
+  $("#log-meta").textContent = "Stopping…";
   try {
-    await api("/api/config", {
-      method: "PUT",
-      body: JSON.stringify({
-        canvas_url: form.canvas_url.value,
-        token: form.token.value || null,
-        download_dir: form.download_dir.value,
-        include: includesFromForm(form),
-        demo_mode: !form.token.value,
-      }),
-    });
-    form.token.value = "";
-    setStatus(status, "Saved on this machine.", true);
-    await loadConfig();
-    await loadMe();
-    await loadCourses();
+    await api(`/api/sync/${activeJob}/stop`, { method: "POST" });
   } catch (err) {
-    setStatus(status, err.message, false);
+    logLine(err.message, "error");
+    finishSync();
   }
-});
-
-$("#clear-token").addEventListener("click", async () => {
-  await api("/api/config", {
-    method: "PUT",
-    body: JSON.stringify({ canvas_url: "https://q.utoronto.ca", clear_token: true, demo_mode: true }),
-  });
-  await loadConfig();
-  await loadMe();
-  await loadCourses();
-  setStatus($("#save-status"), "Token cleared. Demo campus is on.", true);
-});
-
-$("#toggle-demo").addEventListener("click", async () => {
-  const cfg = await api("/api/config");
-  const currentlyDemo = cfg.demo_mode || !cfg.token_set;
-  if (currentlyDemo && !cfg.token_set) {
-    setStatus($("#save-status"), "Paste a Quercus token before leaving the demo campus.", false);
-    return;
-  }
-  await api("/api/config", {
-    method: "PUT",
-    body: JSON.stringify({ canvas_url: cfg.canvas_url, demo_mode: !currentlyDemo }),
-  });
-  await loadConfig();
-  await loadMe();
-  await loadCourses();
-});
+}
 
 $("#reload-courses").addEventListener("click", loadCourses);
 $("#sync-btn").addEventListener("click", () => runSync(false));
 $("#sync-all").addEventListener("click", () => runSync(true));
+$("#stop-btn").addEventListener("click", stopSync);
 
 loadConfig().then(loadMe).then(loadCourses).then(loadLibrary);

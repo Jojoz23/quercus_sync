@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -27,6 +28,13 @@ class _Job:
     def __init__(self) -> None:
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self.done = False
+        self.stop_event = threading.Event()
+        self.engine: CourseSync | None = None
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+        if self.engine is not None:
+            self.engine.request_stop()
 
 
 class SettingsIn(BaseModel):
@@ -144,8 +152,14 @@ async def start_sync(payload: SyncIn) -> dict[str, str]:
             Path(config.download_dir),
             include=config.include,
             on_event=emit,
+            stop_event=job.stop_event,
         )
+        job.engine = engine
         try:
+            if job.stop_event.is_set():
+                emit({"type": "log", "message": "Stopped"})
+                emit({"type": "done", "stats": engine.stats.as_dict(), "errors": []})
+                return
             engine.run(payload.course_ids or None)
         except Exception as exc:  # noqa: BLE001
             emit({"type": "error", "message": str(exc)})
@@ -156,6 +170,15 @@ async def start_sync(payload: SyncIn) -> dict[str, str]:
 
     loop.run_in_executor(None, work)
     return {"job_id": job_id}
+
+
+@app.post("/api/sync/{job_id}/stop")
+def stop_sync(job_id: str) -> dict[str, bool]:
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown sync job")
+    job.request_stop()
+    return {"ok": True}
 
 
 @app.get("/api/sync/{job_id}/events")

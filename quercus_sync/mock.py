@@ -248,7 +248,17 @@ MODULE_ONLY_FILES: dict[int, dict[str, Any]] = {
         "course files/From modules",
         len(_SLIDES_PDF),
         "/demo-files/csc108-review.pdf",
-    )
+    ),
+    77: _file(
+        77,
+        148001,
+        3,
+        "Hidden lecture note.pdf",
+        "hidden-note.pdf",
+        "course files/From pages",
+        len(_LECTURE_PDF),
+        "/demo-files/csc148-hidden.pdf",
+    ),
 }
 
 FOLDERS: dict[int, list[dict[str, Any]]] = {
@@ -346,7 +356,7 @@ PAGES: dict[int, dict[str, dict[str, Any]]] = {
         "welcome": {
             "url": "welcome",
             "title": "Welcome & how this course runs",
-            "body": "<p>Office hours are Tuesday 14:00–16:00 in DH 3072. Use Piazza for non-personal questions.</p><p>You are expected to attempt the pre-lab before Friday.</p>",
+            "body": "<p>Office hours are Tuesday 14:00–16:00 in DH 3072. Use Piazza for non-personal questions.</p><p>You are expected to attempt the pre-lab before Friday.</p><p><a href=\"https://q.utoronto.ca/courses/148001/files/77/download?download_frd=1\">Hidden lecture note</a></p>",
             "updated_at": "2025-09-02T12:00:00Z",
         },
         "tracing-recursion": {
@@ -548,6 +558,7 @@ FILE_BYTES: dict[str, bytes] = {
     "/demo-files/csc108-seating.pdf": _SLIDES_PDF,
     "/demo-files/csc108-review.pdf": _SLIDES_PDF,
     "/demo-files/csc108-lab9.zip": _STARTER_ZIP,
+    "/demo-files/csc148-hidden.pdf": _LECTURE_PDF,
 }
 
 
@@ -586,8 +597,29 @@ class MockCanvasClient:
             return deepcopy(extra)
         raise FileNotFoundError(file_id)
 
+    def folder_files(self, folder_id: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for course_files in FILES.values():
+            for item in course_files:
+                if item.get("folder_id") == folder_id:
+                    rows.append(deepcopy(item))
+        return rows
+
     def folders(self, course_id: int) -> list[dict[str, Any]]:
         return deepcopy(FOLDERS.get(course_id, []))
+
+    def front_page(self, course_id: int) -> dict[str, Any] | None:
+        pages = PAGES.get(course_id) or {}
+        if not pages:
+            return None
+        first = next(iter(pages.values()))
+        return deepcopy(first)
+
+    def quizzes(self, course_id: int) -> list[dict[str, Any]]:
+        return []
+
+    def calendar_events(self, course_id: int) -> list[dict[str, Any]]:
+        return []
 
     def modules(self, course_id: int) -> list[dict[str, Any]]:
         return deepcopy(MODULES.get(course_id, []))

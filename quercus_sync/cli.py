@@ -33,7 +33,7 @@ def doctor() -> None:
     """Check whether a token can talk to Quercus."""
     config = load_config()
     if config.demo_mode or not config.token:
-        console.print("No token saved. Demo mode is on — run [bold]quercus-sync serve[/bold] to paste one.")
+        console.print("No token saved. Copy [bold].env.example[/bold] to [bold].env[/bold] and set QUERCUS_TOKEN.")
         raise typer.Exit(0)
     from quercus_sync.canvas import CanvasClient, CanvasError
 

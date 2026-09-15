@@ -1,8 +1,28 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from html import escape
 from typing import Any
+
+# Canvas page HTML uses /files/:id, /courses/:id/files/:id, and data-file-id.
+_FILE_ID_PATTERNS = (
+    re.compile(r"/api/v1/files/(\d+)", re.I),
+    re.compile(r"/files/(\d+)", re.I),
+    re.compile(r"data-file-id=[\"'](\d+)[\"']", re.I),
+    re.compile(r"data-api-endpoint=[\"'][^\"']*/files/(\d+)", re.I),
+)
+
+
+def canvas_file_ids(html: str | None) -> set[int]:
+    """File IDs a student can already click in Canvas HTML (front page, syllabus, etc.)."""
+    if not html:
+        return set()
+    found: set[int] = set()
+    for pattern in _FILE_ID_PATTERNS:
+        for match in pattern.finditer(html):
+            found.add(int(match.group(1)))
+    return found
 
 
 def html_document(title: str, body_html: str, meta: dict[str, Any] | None = None) -> str:

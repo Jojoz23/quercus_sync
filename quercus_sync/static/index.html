@@ -3,92 +3,48 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Quercus Sync — UTM course archive</title>
+  <title>Quercus Sync</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,650&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
   <div class="shell">
     <header class="mast">
       <div>
-        <p class="eyebrow">University of Toronto Mississauga</p>
         <h1>Quercus Sync</h1>
-        <p class="lede">A local archive of every Quercus course you can still open — this term and past terms that have not been locked. It uses your student Canvas API token, which is the same permission as the website.</p>
+        <p class="who" id="folder-hint"></p>
       </div>
-      <div class="mast-side" id="identity">
-        <span class="pill" id="mode-pill">Demo campus</span>
+      <div class="mast-side">
+        <span class="pill" id="mode-pill">Demo</span>
         <p class="who" id="who">Loading…</p>
       </div>
     </header>
 
-    <section class="notice" id="token-help">
-      <h2>How this should work</h2>
-      <p>Quercus is Canvas. Students get the API for free: you mint a personal access token while signed in, then this app calls JSON endpoints as you. No developer key, no instructor role. If you cannot open a file in the browser, the API cannot download it either.</p>
-      <ol>
-        <li>Sign in at <a href="https://q.utoronto.ca" target="_blank" rel="noreferrer">q.utoronto.ca</a>.</li>
-        <li>Open <strong>Account → Settings → New Access Token</strong>.</li>
-        <li>Give it a purpose like “personal course archive on my laptop” and paste it below. The token never leaves this machine.</li>
-      </ol>
-      <p class="fine">This lists current and concluded enrolments, then copies Files-tab PDFs plus files attached to modules and assignments. Locked or date-restricted courses are skipped. Quiz questions are not fetched. Do not share copyrighted course packs.</p>
-    </section>
+    <p class="banner" id="env-banner" hidden>
+      No token yet. Copy <code>.env.example</code> to <code>.env</code> and set <code>QUERCUS_TOKEN</code>, then restart.
+    </p>
 
-    <div class="grid">
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Connection</h2>
-          <button type="button" class="text-btn" id="toggle-demo">Use demo campus</button>
-        </div>
-        <form id="settings-form" class="stack">
-          <label>
-            Canvas URL
-            <input name="canvas_url" value="https://q.utoronto.ca" autocomplete="off">
-          </label>
-          <label>
-            Access token
-            <input name="token" type="password" placeholder="Paste a Quercus token, or leave blank for demo" autocomplete="off">
-            <span class="hint" id="token-hint">No token saved — demo library is active.</span>
-          </label>
-          <label>
-            Folder on this computer
-            <input name="download_dir" autocomplete="off">
-          </label>
-          <fieldset class="includes">
-            <legend>What to pull</legend>
-            <label><input type="checkbox" name="include" value="files" checked> Course files</label>
-            <label><input type="checkbox" name="include" value="modules" checked> Module outlines</label>
-            <label><input type="checkbox" name="include" value="pages" checked> Pages</label>
-            <label><input type="checkbox" name="include" value="assignments" checked> Assignments</label>
-            <label><input type="checkbox" name="include" value="announcements" checked> Announcements</label>
-            <label><input type="checkbox" name="include" value="syllabus" checked> Syllabus</label>
-            <label><input type="checkbox" name="include" value="discussions"> Discussions</label>
-          </fieldset>
-          <div class="actions">
-            <button type="submit" class="btn">Save connection</button>
-            <button type="button" class="btn ghost" id="clear-token">Forget token</button>
-          </div>
-          <p class="status" id="save-status" hidden></p>
-        </form>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Courses you can still open</h2>
-          <button type="button" class="text-btn" id="reload-courses">Reload</button>
-        </div>
-        <p class="empty" id="course-empty">No courses yet.</p>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Courses</h2>
+        <button type="button" class="text-btn" id="reload-courses">Reload</button>
+      </div>
+      <p class="empty" id="course-empty">No courses yet.</p>
+      <div class="course-scroll">
         <ul class="courses" id="course-list"></ul>
-        <div class="actions">
-          <button type="button" class="btn primary" id="sync-btn">Archive selected</button>
-          <button type="button" class="btn ghost" id="sync-all">Archive all listed</button>
-        </div>
-      </section>
-    </div>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn primary" id="sync-btn">Archive selected</button>
+        <button type="button" class="btn ghost" id="sync-all">Archive all</button>
+        <button type="button" class="btn stop" id="stop-btn" disabled>Stop</button>
+      </div>
+    </section>
 
     <section class="panel log-panel">
       <div class="panel-head">
-        <h2>Sync log</h2>
+        <h2>Log</h2>
         <p class="muted" id="log-meta">Idle</p>
       </div>
       <ol class="log" id="log"></ol>
@@ -96,10 +52,10 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Local library</h2>
+        <h2>Library</h2>
         <p class="muted" id="lib-root"></p>
       </div>
-      <p class="empty" id="lib-empty">Nothing downloaded yet. Run a demo archive to see the folder layout.</p>
+      <p class="empty" id="lib-empty">Nothing downloaded yet.</p>
       <table class="library" id="library">
         <thead>
           <tr><th>Path</th><th>Kind</th><th>Size</th></tr>
@@ -107,10 +63,6 @@
         <tbody></tbody>
       </table>
     </section>
-
-    <footer>
-      <p>Personal use of courses you are enrolled in. Quercus remains the source of truth for due dates and submissions.</p>
-    </footer>
   </div>
   <script src="/assets/app.js"></script>
 </body>
