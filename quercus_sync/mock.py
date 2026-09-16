@@ -259,6 +259,16 @@ MODULE_ONLY_FILES: dict[int, dict[str, Any]] = {
         len(_LECTURE_PDF),
         "/demo-files/csc148-hidden.pdf",
     ),
+    78: _file(
+        78,
+        148001,
+        3,
+        "Week 1 notes.pdf",
+        "week1-notes.pdf",
+        "course files/From pages",
+        len(_LECTURE_PDF),
+        "/demo-files/csc148-week1-guide.pdf",
+    ),
 }
 
 FOLDERS: dict[int, list[dict[str, Any]]] = {
@@ -294,6 +304,12 @@ MODULES: dict[int, list[dict[str, Any]]] = {
             "items": [
                 {"id": 101, "title": "Welcome & how this course runs", "type": "Page", "page_url": "welcome"},
                 {"id": 102, "title": "Week 01 — Python recap.pdf", "type": "File", "content_id": 11},
+                {
+                    "id": 106,
+                    "title": "Lecture recording",
+                    "type": "ExternalUrl",
+                    "external_url": "https://www.youtube.com/watch?v=csc148-week1",
+                },
             ],
         },
         {
@@ -356,8 +372,15 @@ PAGES: dict[int, dict[str, dict[str, Any]]] = {
         "welcome": {
             "url": "welcome",
             "title": "Welcome & how this course runs",
-            "body": "<p>Office hours are Tuesday 14:00–16:00 in DH 3072. Use Piazza for non-personal questions.</p><p>You are expected to attempt the pre-lab before Friday.</p><p><a href=\"https://q.utoronto.ca/courses/148001/files/77/download?download_frd=1\">Hidden lecture note</a></p>",
+            "body": "<p>Office hours are Tuesday 14:00–16:00 in DH 3072. Use Piazza for non-personal questions.</p><p>You are expected to attempt the pre-lab before Friday.</p><p><a href=\"https://q.utoronto.ca/courses/148001/files/77/download?download_frd=1\">Hidden lecture note</a></p><p><a href=\"https://q.utoronto.ca/courses/148001/pages/week-1-guide\">Week 1 guide</a></p><p><a href=\"https://www.youtube.com/watch?v=csc148-home\">Home recording</a></p>",
             "updated_at": "2025-09-02T12:00:00Z",
+        },
+        "week-1-guide": {
+            "url": "week-1-guide",
+            "title": "Week 1 guide",
+            "hidden_from_index": True,
+            "body": "<p>Read the notes, then the recording.</p><p><a href=\"https://q.utoronto.ca/courses/148001/files/78/download?download_frd=1\">Week 1 notes</a></p><iframe src=\"https://play.library.utoronto.ca/watch/demo-week1\"></iframe>",
+            "updated_at": "2025-09-03T12:00:00Z",
         },
         "tracing-recursion": {
             "url": "tracing-recursion",
@@ -559,6 +582,7 @@ FILE_BYTES: dict[str, bytes] = {
     "/demo-files/csc108-review.pdf": _SLIDES_PDF,
     "/demo-files/csc108-lab9.zip": _STARTER_ZIP,
     "/demo-files/csc148-hidden.pdf": _LECTURE_PDF,
+    "/demo-files/csc148-week1-guide.pdf": _LECTURE_PDF,
 }
 
 
@@ -625,10 +649,18 @@ class MockCanvasClient:
         return deepcopy(MODULES.get(course_id, []))
 
     def pages(self, course_id: int) -> list[dict[str, Any]]:
-        return deepcopy(list(PAGES.get(course_id, {}).values()))
+        rows = []
+        for page in (PAGES.get(course_id) or {}).values():
+            if page.get("hidden_from_index"):
+                continue
+            rows.append(deepcopy(page))
+        return rows
 
-    def page(self, course_id: int, slug: str) -> dict[str, Any]:
-        return deepcopy(PAGES[course_id][slug])
+    def page(self, course_id: int, slug: str) -> dict[str, Any] | None:
+        item = (PAGES.get(course_id) or {}).get(slug)
+        if not item:
+            return None
+        return deepcopy(item)
 
     def assignments(self, course_id: int) -> list[dict[str, Any]]:
         return deepcopy(ASSIGNMENTS.get(course_id, []))

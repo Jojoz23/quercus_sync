@@ -40,7 +40,7 @@ class CanvasClient:
             base_url=self.base_url,
             timeout=httpx.Timeout(30.0, read=180.0),
             follow_redirects=False,
-            limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
+            limits=httpx.Limits(max_keepalive_connections=0, max_connections=40),
             headers={
                 "Accept": "application/json",
                 "User-Agent": "quercus-sync/0.1 (personal course archive)",
@@ -179,8 +179,21 @@ class CanvasClient:
             missing_ok=True,
         )
 
-    def page(self, course_id: int, slug: str) -> dict[str, Any]:
-        return self.get_json(f"/api/v1/courses/{course_id}/pages/{slug}")
+    def page(self, course_id: int, slug: str) -> dict[str, Any] | None:
+        from urllib.parse import quote
+
+        encoded = quote(str(slug), safe="-._~")
+        response = self._request("GET", f"/api/v1/courses/{course_id}/pages/{encoded}")
+        if response.status_code in {404, 403}:
+            return None
+        if response.status_code >= 400:
+            raise CanvasError(
+                f"Canvas API {response.status_code} for /api/v1/courses/{course_id}/pages/{encoded}",
+                response.status_code,
+            )
+        if not response.content:
+            return None
+        return response.json()
 
     def assignments(self, course_id: int) -> list[dict[str, Any]]:
         return self.paginate(

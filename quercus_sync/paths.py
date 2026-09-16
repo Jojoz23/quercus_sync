@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -39,27 +41,35 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
-def clip_path(path: Path, limit: int = 240) -> Path:
-    """Keep Windows paths under MAX_PATH so long Quercus titles do not fail to write."""
+def clip_path(path: Path, limit: int = 240, keep_prefix: Path | None = None) -> Path:
+    """Keep Windows paths under MAX_PATH by shortening the leaf first, not the course folder."""
     path = Path(path)
     absolute = path if path.is_absolute() else Path.cwd() / path
     parts = list(absolute.parts)
+    prefix_len = 0
+    if keep_prefix is not None:
+        prefix = keep_prefix if keep_prefix.is_absolute() else Path.cwd() / keep_prefix
+        prefix_parts = list(prefix.parts)
+        if parts[: len(prefix_parts)] == prefix_parts:
+            prefix_len = len(prefix_parts)
     while len(str(Path(*parts))) > limit:
         idx = None
-        longest = 12
-        for i, part in enumerate(parts):
-            if i == 0:
-                continue
-            if len(part) > longest:
-                longest = len(part)
+        for i in range(len(parts) - 1, 0, -1):
+            if i < prefix_len:
+                break
+            if len(parts[i]) > 8:
                 idx = i
+                break
         if idx is None:
             break
         stem, suffix = Path(parts[idx]).stem, Path(parts[idx]).suffix
         keep = max(8, len(stem) - 12)
         shortened = (stem[:keep].rstrip(" .") or "item") + suffix
         if shortened == parts[idx]:
-            break
+            keep = max(4, len(stem) - 1)
+            shortened = (stem[:keep].rstrip(" .") or "item") + suffix
+            if shortened == parts[idx]:
+                break
         parts[idx] = shortened
     return Path(*parts)
 
@@ -70,3 +80,32 @@ def course_folder(code: str, name: str) -> str:
     if name.lower().startswith(code.lower()):
         return name
     return f"{code} — {name}"
+
+
+def long_path(path: Path) -> Path:
+    """Windows MAX_PATH bypass so OneDrive copies and deletes still work."""
+    text = str(path)
+    if text.startswith("\\\\?\\"):
+        return Path(text)
+    absolute = os.path.abspath(text)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+def strip_long_prefix(path: Path) -> Path:
+    text = str(path)
+    if text.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + text[8:])
+    if text.startswith("\\\\?\\"):
+        return Path(text[4:])
+    return Path(text)
+
+
+def iter_files(root: Path) -> Iterator[Path]:
+    start = long_path(root)
+    if not start.exists():
+        return
+    for dirpath, _dirnames, filenames in os.walk(start):
+        for name in filenames:
+            yield strip_long_prefix(Path(dirpath) / name)
