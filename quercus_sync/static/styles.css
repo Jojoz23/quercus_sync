@@ -159,7 +159,7 @@ h2 { font-size: 1.1rem; }
   margin-bottom: 0.35rem;
 }
 .courses strong { display: block; }
-.courses span { color: var(--muted); font-size: 0.82rem; }
+.courses span { display: block; color: var(--muted); font-size: 0.82rem; margin-top: 0.12rem; }
 .empty { color: var(--muted); margin: 0 0 0.5rem; }
 
 .log-panel { min-height: 8rem; }
